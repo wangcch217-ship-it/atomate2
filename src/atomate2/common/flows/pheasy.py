@@ -12,13 +12,21 @@ from atomate2.common.jobs.pheasy import (
     generate_phonon_displacements,
     get_supercell_size,
 )
-from atomate2.common.jobs.phonons import run_phonon_displacements
+from atomate2.common.jobs.phonons import (
+    run_phonon_displacements,
+    get_total_energy_per_cell,  # ← 新增
+)
+from atomate2.common.jobs.utils import (  # ← 新增整个 import
+    structure_to_conventional,
+    structure_to_primitive,
+)
+from jobflow import Flow  # ← 新增
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from emmet.core.math import Matrix3D
-    from jobflow import Flow, Job
+    from jobflow import Job
     from pymatgen.core.structure import Structure
 
     from atomate2.aims.jobs.base import BaseAimsMaker
@@ -73,15 +81,23 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
     displacement: float
         displacement distance for phonons, for most cases 0.01 A is a good choice,
         but it can be increased to 0.02 A for heavier elements.
-    num_displaced_supercells: int
+	 num_displaced_supercells: int
         number of displacements to be generated using a random-displacement approach
         for harmonic phonon calculations. The default value is 0 and the number of
         displacements is automatically determined by the number of atoms in the
         supercell and its space group.
-    cal_anhar_fcs: bool
-        if set to True, anharmonic force constants(FCs) up to fourth-order FCs will
-        be calculated. The default value is False, and only harmonic phonons will
-        be calculated.
+    cal_3rd_order: bool
+        if set to True, third-order force constants will be calculated.
+        Default is False.
+    cal_4th_order: bool
+        if set to True, fourth-order force constants will be calculated.
+        Default is False. Requires cal_3rd_order=True.
+	 cal_ther_cond: bool
+        if set to True, thermal conductivity will be calculated using third-order FCs.
+        Default is False.
+    renorm_phonon: bool
+        if set to True, phonon renormalization will be calculated using up to
+        fourth-order FCs. Requires cal_4th_order=True. Default is False.
     displacement_anhar: float
         displacement distance for anharmonic force constants(FCs) up to fourth-order
         FCs, for most cases 0.08 A is a good choice, but it can be increased to 0.1 A.
@@ -165,15 +181,18 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
     symprec: float = 1e-3
     displacement: float = 0.01
     num_displaced_supercells: int = 0
-    cal_anhar_fcs: bool = False
-    displacement_anhar: float = 0.08
+    cal_3rd_order: bool = False
+    cal_4th_order: bool = False
+    displacement_anhar: float = 0.03
     num_disp_anhar: int = 0
     fcs_cutoff_radius: list = field(
         default_factory=lambda: [-1, 12, 10]
     )  # units in Bohr
+    alm_save_dir: str | None = None  # ALM日志保存目录(绝对路径)
+    cal_ther_cond: bool = False
+    anphon_ther_cond: bool = False
     renorm_phonon: bool = False
     renorm_temp: list = field(default_factory=lambda: [100, 700, 100])
-    cal_ther_cond: bool = False
     ther_cond_mesh: list = field(default_factory=lambda: [20, 20, 20])
     ther_cond_temp: list = field(default_factory=lambda: [100, 700, 100])
     min_length: float | None = 8.0
@@ -197,6 +216,190 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
     store_force_constants: bool = True
     socket: bool = False
 
+    def make(
+        self,
+        structure: Structure,
+        prev_dir: str | Path | None = None,
+        born: list[Matrix3D] | None = None,
+        epsilon_static: Matrix3D | None = None,
+        total_dft_energy_per_formula_unit: float | None = None,
+        supercell_matrix: Matrix3D | None = None,
+    ) -> Flow:
+        """Make flow to calculate the phonon properties.
+
+        Parameters
+        ----------
+        structure : Structure
+            A pymatgen structure object. Please start with a structure
+            that is nearly fully optimized as the internal optimizers
+            have very strict settings!
+        prev_dir : str or Path or None
+            A previous calculation directory to use for copying outputs.
+        born: Matrix3D
+            Instead of recomputing Born charges and epsilon, these values can also be
+            provided manually. If born and epsilon_static are provided, the born run
+            will be skipped it can be provided in the VASP convention with information
+            for every atom in unit cell. Please be careful when converting structures
+            within in this workflow as this could lead to errors
+        epsilon_static: Matrix3D
+            The high-frequency dielectric constant to use instead of recomputing born
+            charges and epsilon. If born, epsilon_static are provided, the born run
+            will be skipped
+        total_dft_energy_per_formula_unit: float
+            It has to be given per formula unit (as a result in corresponding Doc).
+            Instead of recomputing the energy of the bulk structure every time, this
+            value can also be provided in eV. If it is provided, the static run will be
+            skipped. This energy is the typical output dft energy of the DFT workflow.
+            No conversion needed.
+        supercell_matrix: list
+            Instead of min_length, also a supercell_matrix can be given, e.g.
+            [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]
+        """
+        use_symmetrized_structure = self.use_symmetrized_structure
+        kpath_scheme = self.kpath_scheme
+        valid_structs = (None, "primitive", "conventional")
+        if use_symmetrized_structure not in valid_structs:
+            raise ValueError(
+                f"Invalid {use_symmetrized_structure=}, use one of {valid_structs}"
+            )
+
+        if use_symmetrized_structure != "primitive" and kpath_scheme != "seekpath":
+            raise ValueError(
+                f"You can't use {kpath_scheme=} with the primitive standard "
+                "structure, please use seekpath"
+            )
+
+        valid_schemes = ("seekpath", "hinuma", "setyawan_curtarolo", "latimer_munro")
+        if kpath_scheme not in valid_schemes:
+            raise ValueError(
+                f"{kpath_scheme=} is not implemented, use one of {valid_schemes}"
+            )
+
+        if self.code is None or self.code not in SUPPORTED_CODES:
+            raise ValueError(
+                "The code variable must be passed and it must be a supported code."
+                f" Supported codes are: {SUPPORTED_CODES}"
+            )
+
+        jobs = []
+
+        # TODO: should this be after or before structural optimization as the
+        #  optimization could change the symmetry we could add a tutorial and point out
+        #  that the structure should be nearly optimized before the phonon workflow
+        if self.use_symmetrized_structure == "primitive":
+            # These structures are compatible with many
+            # of the kpath algorithms that are used for Materials Project
+            prim_job = structure_to_primitive(structure, self.symprec)
+            jobs.append(prim_job)
+            structure = prim_job.output
+        elif self.use_symmetrized_structure == "conventional":
+            # it could be beneficial to use conventional standard structures to arrive
+            # faster at supercells with right angles
+            conv_job = structure_to_conventional(structure, self.symprec)
+            jobs.append(conv_job)
+            structure = conv_job.output
+
+        optimization_run_job_dir = None
+        optimization_run_uuid = None
+
+        if self.bulk_relax_maker is not None:
+            # optionally relax the structure
+            bulk_kwargs = {}
+            if self.prev_calc_dir_argname is not None:
+                bulk_kwargs[self.prev_calc_dir_argname] = prev_dir
+            bulk = self.bulk_relax_maker.make(structure, **bulk_kwargs)
+            jobs.append(bulk)
+            structure = bulk.output.structure
+            prev_dir = bulk.output.dir_name
+            optimization_run_job_dir = bulk.output.dir_name
+            optimization_run_uuid = bulk.output.uuid
+
+        # if supercell_matrix is None, supercell size will be determined after relax
+        # maker to ensure that cell lengths are really larger than threshold
+        if supercell_matrix is None:
+            supercell_job = self.get_supercell_matrix(structure)
+            jobs.append(supercell_job)
+            supercell_matrix = supercell_job.output
+
+        # Computation of static energy
+        total_dft_energy = None
+        static_run_job_dir = None
+        static_run_uuid = None
+        if (self.static_energy_maker is not None) and (
+            total_dft_energy_per_formula_unit is None
+        ):
+            static_job_kwargs = {}
+            if self.prev_calc_dir_argname is not None:
+                static_job_kwargs[self.prev_calc_dir_argname] = prev_dir
+            static_job = self.static_energy_maker.make(
+                structure=structure, **static_job_kwargs
+            )
+            jobs.append(static_job)
+            total_dft_energy = static_job.output.output.energy
+            static_run_job_dir = static_job.output.dir_name
+            static_run_uuid = static_job.output.uuid
+            prev_dir = static_job.output.dir_name
+        elif total_dft_energy_per_formula_unit is not None:
+            # to make sure that one can reuse results from Doc
+            compute_total_energy_job = get_total_energy_per_cell(
+                total_dft_energy_per_formula_unit, structure
+            )
+            jobs.append(compute_total_energy_job)
+            total_dft_energy = compute_total_energy_job.output
+
+        # get a phonon object from phonopy
+        displacements_job = self.get_displacements(structure, supercell_matrix)
+        jobs.append(displacements_job)
+
+        displacement_calcs = self.run_displacements(
+            displacements_job.output["structures"],  # 清晰！
+            prev_dir,
+            structure,
+            supercell_matrix
+        )
+        jobs.append(displacement_calcs)
+
+        # Computation of BORN charges
+        born_run_job_dir = None
+        born_run_uuid = None
+        if self.born_maker is not None and (born is None or epsilon_static is None):
+            born_kwargs = {}
+            if self.prev_calc_dir_argname is not None:
+                born_kwargs[self.prev_calc_dir_argname] = prev_dir
+            born_job = self.born_maker.make(structure, **born_kwargs)
+            jobs.append(born_job)
+
+            # I am not happy how we currently access "born" charges
+            # This is very vasp specific code aims and forcefields
+            # do not support this at the moment, if this changes we have
+            # to update this section
+            epsilon_static = born_job.output.calcs_reversed[0].output.epsilon_static
+            born = born_job.output.calcs_reversed[0].output.outcar["born"]
+            born_run_job_dir = born_job.output.dir_name
+            born_run_uuid = born_job.output.uuid
+
+        # ✅ 传递元数据
+        phonon_collect = self.get_results(
+            born,
+            born_run_job_dir,
+            born_run_uuid,
+            displacement_calcs,
+            displacements_job.output["metadata"],  # 清晰！
+            epsilon_static,
+            optimization_run_job_dir,
+            optimization_run_uuid,
+            static_run_job_dir,
+            static_run_uuid,
+            structure,
+            supercell_matrix,
+            total_dft_energy,
+        )
+
+        jobs.append(phonon_collect)
+
+        # create a flow including all jobs for a phonon computation
+        return Flow(jobs, phonon_collect.output)
+    
     def get_displacements(
         self, structure: Structure, supercell_matrix: Matrix3D
     ) -> Job | Flow:
@@ -217,7 +420,9 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
             supercell_matrix=supercell_matrix,
             displacement=self.displacement,
             num_displaced_supercells=self.num_displaced_supercells,
-            cal_anhar_fcs=self.cal_anhar_fcs,
+            cal_3rd_order=self.cal_3rd_order,
+            cal_4th_order=self.cal_4th_order,
+            cal_ther_cond=self.cal_ther_cond,
             displacement_anhar=self.displacement_anhar,
             num_disp_anhar=self.num_disp_anhar,
             fcs_cutoff_radius=self.fcs_cutoff_radius,
@@ -226,11 +431,12 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
             use_symmetrized_structure=self.use_symmetrized_structure,
             kpath_scheme=self.kpath_scheme,
             code=self.code,
+            alm_save_dir=self.alm_save_dir, 
         )
 
     def run_displacements(
         self,
-        displacements: Job | Flow,
+        displacements: list[Structure],
         prev_dir: str | Path | None,
         structure: Structure,
         supercell_matrix: Matrix3D,
@@ -240,7 +446,8 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
 
         Parameters
         ----------
-        displacements: Job | Flow
+        displacements: list[Structure]  # ✅ 更新文档：结构列表
+        	List of displaced structures to calculate
         prev_dir: str | Path | None
         structure: Structure
         supercell_matrix:  Matrix3D
@@ -251,7 +458,7 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
         """
         # perform the phonon displacement calculations
         return run_phonon_displacements(
-            displacements=displacements.output,
+            displacements=displacements,
             structure=structure,
             supercell_matrix=supercell_matrix,
             phonon_maker=self.phonon_displacement_maker,
@@ -267,6 +474,7 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
         born_run_job_dir: str,
         born_run_uuid: str,
         displacement_calcs: Job | Flow,
+        displacement_metadata: dict,  
         epsilon_static: Matrix3D,
         optimization_run_job_dir: str,
         optimization_run_uuid: str,
@@ -301,11 +509,13 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
         return generate_frequencies_eigenvectors(
             supercell_matrix=supercell_matrix,
             displacement=self.displacement,
-            cal_anhar_fcs=self.cal_anhar_fcs,
+            cal_3rd_order=self.cal_3rd_order,
+            cal_4th_order=self.cal_4th_order,
             fcs_cutoff_radius=self.fcs_cutoff_radius,
             renorm_phonon=self.renorm_phonon,
             renorm_temp=self.renorm_temp,
             cal_ther_cond=self.cal_ther_cond,
+            anphon_ther_cond=self.anphon_ther_cond,
             ther_cond_mesh=self.ther_cond_mesh,
             ther_cond_temp=self.ther_cond_temp,
             sym_reduce=self.sym_reduce,
@@ -315,6 +525,7 @@ class BasePhononMaker(PurePhonopyMaker, ABC):
             code=self.code,
             structure=structure,
             displacement_data=displacement_calcs.output,
+            displacement_metadata=displacement_metadata, 
             epsilon_static=epsilon_static,
             born=born,
             total_dft_energy=total_dft_energy,
